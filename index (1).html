@@ -3,20 +3,23 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>X-RAY HAND PORTAL ENGINE v2.4</title>
+<title>X-RAY HAND PORTAL ENGINE v3.0</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
   #canvas { display: block; width: 100vw; height: 100vh; }
-  #overlay-ui {
-    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-    pointer-events: none; z-index: 10;
-  }
   #status-bar {
     position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
     color: #0ff; font-size: 11px; letter-spacing: 3px; text-transform: uppercase;
-    text-shadow: 0 0 8px #0ff; opacity: 0.7;
+    text-shadow: 0 0 8px #0ff; opacity: 0.7; pointer-events: none;
   }
+  #thermal-badge {
+    position: fixed; top: 40px; right: 20px;
+    color: #ff6600; font-size: 10px; letter-spacing: 2px;
+    text-shadow: 0 0 8px #f60; opacity: 0; transition: opacity 0.3s;
+    pointer-events: none; z-index: 20;
+  }
+  #thermal-badge.on { opacity: 1; }
   #init-overlay {
     position: fixed; inset: 0; background: #000;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -27,15 +30,8 @@
     margin-bottom: 20px; animation: pulse 1.5s infinite;
   }
   #init-overlay p { font-size: 13px; letter-spacing: 3px; opacity: 0.6; }
-  #init-overlay .bar {
-    width: 280px; height: 2px; background: #0ff2;
-    margin-top: 24px; overflow: hidden;
-  }
-  #init-overlay .bar-fill {
-    height: 100%; background: #0ff;
-    animation: load 2s forwards;
-    box-shadow: 0 0 10px #0ff;
-  }
+  #init-overlay .bar { width: 280px; height: 2px; background: #0ff2; margin-top: 24px; overflow: hidden; }
+  #init-overlay .bar-fill { height: 100%; background: #0ff; animation: load 2s forwards; box-shadow: 0 0 10px #0ff; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
   @keyframes load { from{width:0} to{width:100%} }
 </style>
@@ -51,6 +47,7 @@
 
 <canvas id="canvas"></canvas>
 <div id="status-bar">SYSTEM READY — POSITION HANDS TO ACTIVATE PORTAL</div>
+<div id="thermal-badge">◈ THERMAL MODE ACTIVE</div>
 
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/holistic.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
@@ -62,155 +59,162 @@
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 let W, H;
-
-function resize() {
-  W = canvas.width = window.innerWidth;
-  H = canvas.height = window.innerHeight;
-}
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
 resize();
 window.addEventListener('resize', resize);
 
-// State
+// ── THERMAL MODE (press T) ──
+let thermalMode = false;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 't' || e.key === 'T') {
+    thermalMode = !thermalMode;
+    document.getElementById('thermal-badge').classList.toggle('on', thermalMode);
+    // Force color refresh on all particles
+    for (const p of particles) { if (p.inBody) p.needsColorRefresh = true; }
+  }
+});
+
+// ─────────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────────
 const state = {
   portalActive: false,
-  portalScale: 1,
-  portalCenter: { x: 0, y: 0 },
-  portalCorners: null,
   smoothCorners: null,
-  fps: 0,
-  frameCount: 0,
+  portalAngle: 0,
+  fps: 0, frameCount: 0,
   scanPhase: 'IDLE',
-  glitchActive: false,
-  glitchTimer: 0,
-  energyBurst: false,
-  burstTimer: 0,
-  lastTime: performance.now(),
-  fpsArr: [],
-  segMask: null,
-  poseL: null,
-  poseR: null,
-  poseLandmarks: null,
-  handLeftLandmarks: null,
-  handRightLandmarks: null,
+  glitchActive: false, glitchTimer: 0, glitchFrame: 0,
+  energyBurst: false, burstTimer: 0,
+  lastTime: performance.now(), fpsArr: [],
+  segMask: null, poseLandmarks: null,
+  handLeftLandmarks: null, handRightLandmarks: null,
+  // chest tracking for body-lock
+  prevChestX: -1, prevChestY: -1,
+  chestX: 0, chestY: 0,
 };
 
-// Smoothed landmark storage
 const smooth = {
-  lIndex: { x: 0, y: 0 },
-  lThumb: { x: 0, y: 0 },
-  rIndex: { x: 0, y: 0 },
-  rThumb: { x: 0, y: 0 },
-  center: { x: W/2, y: H/2 },
+  lIndex: { x: 0, y: 0 }, lThumb: { x: 0, y: 0 },
+  rIndex: { x: 0, y: 0 }, rThumb: { x: 0, y: 0 },
+  center: { x: 0, y: 0 },
 };
 
 const LERP = 0.18;
-
+const CORNER_LERP = 0.13;
 function lerp(a, b, t) { return a + (b - a) * t; }
 function lerpPt(a, b, t) { return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) }; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// ─────────────────────────────────────────────
+//  ADAPTIVE PARTICLE COUNT
+// ─────────────────────────────────────────────
+const MAX_PARTICLES = 9000;
+const MIN_PARTICLES = 4000;
+let activeParticleCount = MAX_PARTICLES;
 
 // ─────────────────────────────────────────────
 //  PARTICLE SYSTEM
 // ─────────────────────────────────────────────
-const MAX_PARTICLES = 9000;
 const particles = [];
-
 const LAYERS = { BACK: 0, MID: 1, FRONT: 2 };
 
-function createParticle() {
+function createParticle(idx) {
   const layer = Math.random() < 0.4 ? LAYERS.BACK : Math.random() < 0.6 ? LAYERS.MID : LAYERS.FRONT;
   return {
-    x: Math.random() * W,
-    y: Math.random() * H,
-    vx: (Math.random() - 0.5) * 0.4,
-    vy: (Math.random() - 0.5) * 0.4 - 0.1,
-    layer,
-    energy: Math.random(),
-    age: Math.random() * 200,
+    x: Math.random() * (W || 800), y: Math.random() * (H || 600),
+    vx: (Math.random() - 0.5) * 0.4, vy: (Math.random() - 0.5) * 0.4 - 0.1,
+    layer, energy: Math.random(), age: Math.random() * 200,
     color: [0, 255, 255],
-    size: layer === LAYERS.BACK ? 1 : layer === LAYERS.MID ? 1.5 : 2.2,
+    baseSize: layer === LAYERS.BACK ? 1 : layer === LAYERS.MID ? 1.5 : 2.2,
     alpha: layer === LAYERS.BACK ? 0.3 : layer === LAYERS.MID ? 0.6 : 0.9,
-    zone: 0,
-    noiseX: Math.random() * 1000,
-    noiseY: Math.random() * 1000,
-    baseX: 0,
-    baseY: 0,
-    inBody: false,
+    zone: 0, noiseX: Math.random() * 1000, noiseY: Math.random() * 1000,
+    baseX: 0, baseY: 0,
+    // fixed target index into bodyPointsArray — assigned proportionally
+    targetIdx: Math.floor((idx / MAX_PARTICLES) * 100),
+    inBody: false, needsColorRefresh: false,
   };
 }
-
-for (let i = 0; i < MAX_PARTICLES; i++) particles.push(createParticle());
+for (let i = 0; i < MAX_PARTICLES; i++) particles.push(createParticle(i));
 
 // Zone color map
 const ZONE_COLORS = {
-  0: [200, 240, 255],  // head - white/cyan
-  1: [255, 100, 160],  // chest - pink/red
-  2: [0, 220, 200],    // arms - teal
-  3: [255, 210, 40],   // hands - gold
-  4: [180, 60, 255],   // core - purple
-  5: [60, 120, 255],   // legs - blue
-  6: [255, 140, 40],   // feet - orange
+  0: [200, 240, 255], 1: [255, 100, 160], 2: [0, 220, 200],
+  3: [255, 210, 40],  4: [180, 60, 255],  5: [60, 120, 255], 6: [255, 140, 40],
 };
 
+function thermalColor(ny) {
+  const t = clamp(ny, 0, 1);
+  if (t < 0.25) return [0, Math.floor(t * 4 * 200), 255];
+  if (t < 0.5)  return [0, 200, Math.floor((1 - (t - 0.25) * 4) * 255)];
+  if (t < 0.75) return [Math.floor((t - 0.5) * 4 * 255), 200, 0];
+  return [255, Math.floor((1 - (t - 0.75) * 4) * 200), 0];
+}
+
 // ─────────────────────────────────────────────
-//  OFFSCREEN SEGMENTATION
+//  STABLE BODY POINT ARRAY
 // ─────────────────────────────────────────────
 const segCanvas = document.createElement('canvas');
-const segCtx = segCanvas.getContext('2d');
+const segCtx = segCanvas.getContext('2d', { willReadFrequently: true });
+let bodyPointsArray = new Float32Array(0);
+let bodyPointCount = 0;
+let bodyBounds = { cx: 0.5, cy: 0.5 };
 
-let bodyPixels = null;
-let bodyBounds = { minX: 0, maxX: W, minY: 0, maxY: H, cx: W/2, cy: H/2 };
-
-function updateBodyPixels(mask) {
-  segCanvas.width = mask.width;
-  segCanvas.height = mask.height;
+function updateBodyPoints(mask) {
+  const mw = mask.width, mh = mask.height;
+  if (mw === 0 || mh === 0) return;
+  segCanvas.width = mw;
+  segCanvas.height = mh;
   segCtx.drawImage(mask, 0, 0);
-  const imgData = segCtx.getImageData(0, 0, mask.width, mask.height);
+  const imgData = segCtx.getImageData(0, 0, mw, mh);
   const data = imgData.data;
-  const pts = [];
-  let minX = mask.width, maxX = 0, minY = mask.height, maxY = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    const alpha = data[i + 3];
-    if (alpha > 100) {
-      const px = (i / 4) % mask.width;
-      const py = Math.floor((i / 4) / mask.width);
-      pts.push(px / mask.width, py / mask.height);
-      if (px < minX) minX = px;
-      if (px > maxX) maxX = px;
-      if (py < minY) minY = py;
-      if (py > maxY) maxY = py;
+
+  const tmp = [];
+  let minX = mw, maxX = 0, minY = mh, maxY = 0;
+  // Sub-sample every 2px to keep array manageable
+  for (let py = 0; py < mh; py += 2) {
+    for (let px = 0; px < mw; px += 2) {
+      if (data[(py * mw + px) * 4 + 3] > 100) {
+        tmp.push(px / mw, py / mh);
+        if (px < minX) minX = px; if (px > maxX) maxX = px;
+        if (py < minY) minY = py; if (py > maxY) maxY = py;
+      }
     }
   }
-  bodyPixels = pts;
-  bodyBounds = {
-    minX: minX / mask.width,
-    maxX: maxX / mask.width,
-    minY: minY / mask.height,
-    maxY: maxY / mask.height,
-    cx: ((minX + maxX) / 2) / mask.width,
-    cy: ((minY + maxY) / 2) / mask.height,
-  };
+
+  const count = tmp.length >> 1;
+  if (count < 10) return;
+
+  const prevCount = bodyPointCount;
+  bodyPointsArray = new Float32Array(tmp);
+  bodyPointCount = count;
+  bodyBounds.cx = ((minX + maxX) * 0.5) / mw;
+  bodyBounds.cy = ((minY + maxY) * 0.5) / mh;
+
+  // Only re-assign target indices if body point count changed significantly (>10%)
+  if (Math.abs(count - prevCount) > prevCount * 0.1 || prevCount === 0) {
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      particles[i].targetIdx = Math.floor((i / MAX_PARTICLES) * count);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
 //  ZONE CLASSIFIER
 // ─────────────────────────────────────────────
-function classifyZone(nx, ny, landmarks) {
-  if (!landmarks) return 4;
-  const nose = landmarks[0];
+function classifyZone(nx, ny, lm) {
+  if (!lm) return 4;
+  const nose = lm[0];
   if (!nose) return 4;
-  if (ny < nose.y - 0.05) return 0;           // head
-  if (ny < nose.y + 0.15) return 1;           // chest
-  const ls = landmarks[11], rs = landmarks[12];
+  if (ny < nose.y - 0.05) return 0;
+  if (ny < nose.y + 0.15) return 1;
+  const ls = lm[11], rs = lm[12];
   if (ls && rs) {
     const armW = Math.abs(rs.x - ls.x) * 0.8;
-    const armCx = (ls.x + rs.x) / 2;
-    if (Math.abs(nx - armCx) > armW) return 2; // arms
+    const armCx = (ls.x + rs.x) * 0.5;
+    if (Math.abs(nx - armCx) > armW) return 2;
   }
-  if (ny > 0.75) {
-    if (ny > 0.9) return 6; // feet
-    return 5; // legs
-  }
-  return 4; // core
+  if (ny > 0.75) return ny > 0.9 ? 6 : 5;
+  return 4;
 }
 
 // ─────────────────────────────────────────────
@@ -220,14 +224,11 @@ const scanline = { y: 0, speed: 1.8 };
 const ripples = [];
 const dataStreams = [];
 const glitchSlices = [];
-let hue = 0;
-let radarAngle = 0;
+let hue = 0, radarAngle = 0;
 
-// Init data streams
 for (let i = 0; i < 12; i++) {
   dataStreams.push({
-    x: Math.random(),
-    y: Math.random(),
+    x: Math.random(), y: Math.random(),
     speed: 0.002 + Math.random() * 0.004,
     len: 0.04 + Math.random() * 0.08,
     alpha: 0.3 + Math.random() * 0.5,
@@ -235,7 +236,7 @@ for (let i = 0; i < 12; i++) {
 }
 
 // ─────────────────────────────────────────────
-//  MEDIAPIPE SETUP
+//  MEDIAPIPE
 // ─────────────────────────────────────────────
 const videoEl = document.createElement('video');
 videoEl.style.display = 'none';
@@ -244,17 +245,12 @@ document.body.appendChild(videoEl);
 const holistic = new Holistic({
   locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/${f}`
 });
-
 holistic.setOptions({
-  modelComplexity: 1,
-  smoothLandmarks: true,
-  enableSegmentation: true,
-  smoothSegmentation: true,
+  modelComplexity: 1, smoothLandmarks: true,
+  enableSegmentation: true, smoothSegmentation: true,
   refineFaceLandmarks: false,
-  minDetectionConfidence: 0.5,
-  minTrackingConfidence: 0.5,
+  minDetectionConfidence: 0.5, minTrackingConfidence: 0.5,
 });
-
 holistic.onResults(onResults);
 
 function onResults(results) {
@@ -263,10 +259,63 @@ function onResults(results) {
   state.handLeftLandmarks = results.leftHandLandmarks || null;
   state.handRightLandmarks = results.rightHandLandmarks || null;
 
-  if (state.segMask) updateBodyPixels(state.segMask);
+  if (state.segMask) updateBodyPoints(state.segMask);
+  updateChestTracking();
   processGestures();
   distributeParticles();
 }
+
+// ── CHEST TRACKING ──
+function updateChestTracking() {
+  const lm = state.poseLandmarks;
+  if (!lm || !lm[11] || !lm[12]) return;
+  const cx = ((1 - lm[11].x) + (1 - lm[12].x)) * 0.5 * W;
+  const cy = (lm[11].y + lm[12].y) * 0.5 * H;
+  if (state.prevChestX < 0) { state.prevChestX = cx; state.prevChestY = cy; }
+  state.chestX = cx; state.chestY = cy;
+}
+
+// ── DISTRIBUTE PARTICLES — STABLE FIXED MAPPING ──
+function distributeParticles() {
+  if (bodyPointCount < 10) return;
+  const lm = state.poseLandmarks;
+
+  // Body-lock delta
+  const dX = state.chestX - state.prevChestX;
+  const dY = state.chestY - state.prevChestY;
+  // Only apply if delta is sane (ignore huge jumps from init)
+  const applyDelta = (Math.abs(dX) < 60 && Math.abs(dY) < 60);
+  state.prevChestX = state.chestX;
+  state.prevChestY = state.chestY;
+
+  const limit = activeParticleCount;
+  for (let i = 0; i < limit; i++) {
+    const p = particles[i];
+
+    // Apply movement delta to base position for all in-body particles
+    if (p.inBody && applyDelta && (dX !== 0 || dY !== 0)) {
+      p.baseX += dX;
+      p.baseY += dY;
+    }
+
+    // Periodically refresh world position from fixed target index
+    if (!p.inBody || p.needsColorRefresh || Math.random() < 0.006) {
+      const ti = clamp(p.targetIdx, 0, bodyPointCount - 1);
+      const nx = bodyPointsArray[ti * 2];
+      const ny = bodyPointsArray[ti * 2 + 1];
+      p.baseX = (1 - nx) * W;
+      p.baseY = ny * H;
+      p.inBody = true;
+      p.needsColorRefresh = false;
+      const zone = classifyZone(nx, ny, lm);
+      p.zone = zone;
+      p.color = thermalMode ? thermalColor(ny) : ZONE_COLORS[zone];
+    }
+  }
+}
+
+// ── GESTURE LOGIC WITH HYSTERESIS ──
+const ACT_TIP = 120, DEACT_TIP = 200, ACT_THUMB = 100;
 
 function processGestures() {
   const lh = state.handLeftLandmarks;
@@ -290,31 +339,45 @@ function processGestures() {
 
   const tipDist = Math.hypot(smooth.lIndex.x - smooth.rIndex.x, smooth.lIndex.y - smooth.rIndex.y);
   const thmDist = Math.hypot(smooth.lThumb.x - smooth.rThumb.x, smooth.lThumb.y - smooth.rThumb.y);
-  const cx = (smooth.lIndex.x + smooth.lThumb.x + smooth.rIndex.x + smooth.rThumb.x) / 4;
-  const cy = (smooth.lIndex.y + smooth.lThumb.y + smooth.rIndex.y + smooth.rThumb.y) / 4;
-
+  const cx = (smooth.lIndex.x + smooth.lThumb.x + smooth.rIndex.x + smooth.rThumb.x) * 0.25;
+  const cy = (smooth.lIndex.y + smooth.lThumb.y + smooth.rIndex.y + smooth.rThumb.y) * 0.25;
   smooth.center = lerpPt(smooth.center, { x: cx, y: cy }, LERP);
 
   const wasActive = state.portalActive;
-  state.portalActive = tipDist < 180;
+  // Hysteresis
+  if (!wasActive) {
+    state.portalActive = (tipDist < ACT_TIP && thmDist > ACT_THUMB);
+  } else {
+    state.portalActive = (tipDist < DEACT_TIP);
+  }
   state.scanPhase = state.portalActive ? 'ACTIVE' : 'SCANNING';
 
+  // Portal rotation from hand orientation
+  const rawAngle = Math.atan2(
+    smooth.rIndex.y - smooth.lIndex.y,
+    smooth.rIndex.x - smooth.lIndex.x
+  );
+  state.portalAngle = lerp(state.portalAngle, rawAngle, LERP * 0.5);
+
   if (state.portalActive) {
-    state.portalCorners = [
-      { ...smooth.lIndex },
-      { ...smooth.lThumb },
-      { ...smooth.rThumb },
-      { ...smooth.rIndex },
+    const target = [
+      { ...smooth.lIndex }, { ...smooth.lThumb },
+      { ...smooth.rThumb }, { ...smooth.rIndex },
     ];
-    if (!state.smoothCorners) state.smoothCorners = [...state.portalCorners];
-    else {
+
+    if (!state.smoothCorners) {
+      state.smoothCorners = target.map(p => ({ ...p }));
+    } else {
       for (let i = 0; i < 4; i++) {
-        state.smoothCorners[i] = lerpPt(state.smoothCorners[i], state.portalCorners[i], LERP * 1.2);
+        const dx = target[i].x - state.smoothCorners[i].x;
+        const dy = target[i].y - state.smoothCorners[i].y;
+        // Clamp delta to suppress jitter spikes
+        state.smoothCorners[i].x += clamp(dx * CORNER_LERP, -35, 35);
+        state.smoothCorners[i].y += clamp(dy * CORNER_LERP, -35, 35);
       }
     }
 
     if (!wasActive) {
-      // burst on activation
       state.energyBurst = true;
       state.burstTimer = 30;
       ripples.push({ x: smooth.center.x, y: smooth.center.y, r: 0, maxR: 300, alpha: 1 });
@@ -324,42 +387,20 @@ function processGestures() {
   }
 }
 
-function distributeParticles() {
-  if (!bodyPixels || bodyPixels.length < 2) return;
-  const totalPts = bodyPixels.length / 2;
-  for (let i = 0; i < particles.length; i++) {
-    if (Math.random() < 0.04) {
-      const idx = Math.floor(Math.random() * totalPts);
-      const nx = bodyPixels[idx * 2];
-      const ny = bodyPixels[idx * 2 + 1];
-      particles[i].baseX = (1 - nx) * W;
-      particles[i].baseY = ny * H;
-      particles[i].inBody = true;
-      const zone = classifyZone(nx, ny, state.poseLandmarks);
-      particles[i].zone = zone;
-      particles[i].color = ZONE_COLORS[zone];
-    }
-  }
-}
-
 // Camera
-let cameraReady = false;
 const camera = new Camera(videoEl, {
-  onFrame: async () => {
-    await holistic.send({ image: videoEl });
-    cameraReady = true;
-  },
-  width: 640,
-  height: 480,
+  onFrame: async () => { await holistic.send({ image: videoEl }); },
+  width: 640, height: 480,
 });
 camera.start().then(() => {
   document.getElementById('init-overlay').style.display = 'none';
-}).catch(e => {
-  document.getElementById('init-overlay').querySelector('p').textContent = 'CAMERA ACCESS DENIED — ENABLE CAMERA';
+}).catch(() => {
+  const p = document.getElementById('init-overlay').querySelectorAll('p')[0];
+  if (p) p.textContent = 'CAMERA ACCESS DENIED — ENABLE CAMERA';
 });
 
 // ─────────────────────────────────────────────
-//  NOISE (simple 2D via sin/cos)
+//  NOISE
 // ─────────────────────────────────────────────
 function noise2(x, y, t) {
   return Math.sin(x * 3.7 + t) * Math.cos(y * 2.3 - t * 0.7) * 0.5 + 0.5;
@@ -370,11 +411,9 @@ function noise2(x, y, t) {
 // ─────────────────────────────────────────────
 function drawBackground() {
   ctx.save();
-  ctx.translate(W, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(videoEl, 0, 0, W, H);
+  ctx.translate(W, 0); ctx.scale(-1, 1);
+  try { ctx.drawImage(videoEl, 0, 0, W, H); } catch(e) {}
   ctx.restore();
-  // Dark vignette overlay
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
   ctx.fillRect(0, 0, W, H);
 }
@@ -385,15 +424,13 @@ function drawBackground() {
 function drawGrid(cx, cy) {
   const fine = 28, coarse = 90;
   ctx.lineWidth = 0.3;
-
   ctx.strokeStyle = `hsla(${hue},100%,60%,0.09)`;
-  for (let x = cx % fine; x < W; x += fine) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-  for (let y = cy % fine; y < H; y += fine) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-
+  for (let x = cx % fine; x < W; x += fine) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = cy % fine; y < H; y += fine) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
   ctx.strokeStyle = `hsla(${hue+40},100%,70%,0.13)`;
   ctx.lineWidth = 0.5;
-  for (let x = cx % coarse; x < W; x += coarse) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-  for (let y = cy % coarse; y < H; y += coarse) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  for (let x = cx % coarse; x < W; x += coarse) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = cy % coarse; y < H; y += coarse) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
 }
 
 // ─────────────────────────────────────────────
@@ -405,7 +442,6 @@ function updateRipples() {
     r.r += 4;
     r.alpha = Math.max(0, 1 - r.r / r.maxR);
     if (r.alpha <= 0) { ripples.splice(i, 1); continue; }
-
     ctx.beginPath();
     ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
     ctx.strokeStyle = `hsla(${hue+180},100%,70%,${r.alpha * 0.6})`;
@@ -417,20 +453,16 @@ function updateRipples() {
 // ─────────────────────────────────────────────
 //  RENDER: DATA STREAMS
 // ─────────────────────────────────────────────
-function drawDataStreams(t) {
+function drawDataStreams() {
   for (const s of dataStreams) {
     s.y -= s.speed;
     if (s.y < -s.len) s.y = 1 + s.len;
     const sx = s.x * W, sy = s.y * H;
-    const grad = ctx.createLinearGradient(sx, sy - s.len * H, sx, sy);
-    grad.addColorStop(0, 'transparent');
-    grad.addColorStop(1, `hsla(${hue+60},100%,80%,${s.alpha})`);
-    ctx.strokeStyle = grad;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(sx, sy - s.len * H);
-    ctx.lineTo(sx, sy);
-    ctx.stroke();
+    const g = ctx.createLinearGradient(sx, sy - s.len * H, sx, sy);
+    g.addColorStop(0, 'transparent');
+    g.addColorStop(1, `hsla(${hue+60},100%,80%,${s.alpha})`);
+    ctx.strokeStyle = g; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(sx, sy - s.len * H); ctx.lineTo(sx, sy); ctx.stroke();
   }
 }
 
@@ -440,27 +472,29 @@ function drawDataStreams(t) {
 function drawScanline() {
   scanline.y += scanline.speed;
   if (scanline.y > H + 20) scanline.y = -20;
-
-  const grad = ctx.createLinearGradient(0, scanline.y - 30, 0, scanline.y + 30);
-  grad.addColorStop(0, 'transparent');
-  grad.addColorStop(0.45, `hsla(${hue},100%,80%,0.05)`);
-  grad.addColorStop(0.5, `hsla(${hue},100%,90%,0.15)`);
-  grad.addColorStop(0.55, `hsla(${hue},100%,80%,0.05)`);
-  grad.addColorStop(1, 'transparent');
-  ctx.fillStyle = grad;
+  const g = ctx.createLinearGradient(0, scanline.y - 30, 0, scanline.y + 30);
+  g.addColorStop(0, 'transparent');
+  g.addColorStop(0.45, `hsla(${hue},100%,80%,0.05)`);
+  g.addColorStop(0.5, `hsla(${hue},100%,90%,0.15)`);
+  g.addColorStop(0.55, `hsla(${hue},100%,80%,0.05)`);
+  g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g;
   ctx.fillRect(0, scanline.y - 30, W, 60);
 }
 
 // ─────────────────────────────────────────────
-//  RENDER: PARTICLES
+//  RENDER: PARTICLES (body-locked + depth scale)
 // ─────────────────────────────────────────────
 function drawParticles(t) {
-  const chestX = W * 0.5, chestY = H * 0.4;
-
-  // Update + batch by layer
+  const chestX = state.chestX || W * 0.5;
+  const chestY = state.chestY || H * 0.4;
+  const pcx = smooth.center.x || W * 0.5;
+  const pcy = smooth.center.y || H * 0.5;
   const byLayer = [[], [], []];
+  const limit = activeParticleCount;
 
-  for (const p of particles) {
+  for (let i = 0; i < limit; i++) {
+    const p = particles[i];
     if (!p.inBody) continue;
 
     p.age++;
@@ -470,144 +504,148 @@ function drawParticles(t) {
     const nx = noise2(p.noiseX, p.noiseY, t * 0.0005) - 0.5;
     const ny = noise2(p.noiseX + 5, p.noiseY + 5, t * 0.0005) - 0.5;
 
-    p.vx = p.vx * 0.95 + nx * 0.25 + (p.baseX - p.x) * 0.006;
-    p.vy = p.vy * 0.95 + ny * 0.25 + (p.baseY - p.y) * 0.006 + (chestY - p.y) * 0.0004;
+    // Stronger attraction (0.02) for tight body lock
+    p.vx = p.vx * 0.92 + nx * 0.18 + (p.baseX - p.x) * 0.022;
+    p.vy = p.vy * 0.92 + ny * 0.18 + (p.baseY - p.y) * 0.022 + (chestY - p.y) * 0.0003;
 
     if (state.energyBurst) {
       const bx = p.x - smooth.center.x, by = p.y - smooth.center.y;
       const bd = Math.hypot(bx, by) || 1;
-      p.vx += (bx / bd) * 3;
-      p.vy += (by / bd) * 3;
+      p.vx += (bx / bd) * 3; p.vy += (by / bd) * 3;
     }
 
-    p.x += p.vx;
-    p.y += p.vy;
+    p.x += p.vx; p.y += p.vy;
 
-    const energyWave = Math.sin(t * 0.003 + Math.hypot(p.x - chestX, p.y - chestY) * 0.04);
-    const pulseAlpha = p.alpha * (0.7 + energyWave * 0.3);
+    const eWave = Math.sin(t * 0.003 + Math.hypot(p.x - chestX, p.y - chestY) * 0.04);
+    const pAlpha = p.alpha * (0.7 + eWave * 0.3);
 
-    byLayer[p.layer].push({ x: p.x, y: p.y, c: p.color, a: pulseAlpha, s: p.size });
+    // Fake depth: particles closer to portal center appear slightly larger
+    const dist = Math.hypot(p.x - pcx, p.y - pcy);
+    const depthScale = 1 / (1 + dist * 0.0007);
+    const sz = Math.max(0.4, p.baseSize * depthScale);
+
+    byLayer[p.layer].push({ x: p.x, y: p.y, c: p.color, a: pAlpha, s: sz });
   }
 
-  // Render batches
   for (const lyr of [LAYERS.BACK, LAYERS.MID, LAYERS.FRONT]) {
-    for (const p of byLayer[lyr]) {
-      ctx.fillStyle = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},${p.a})`;
-      ctx.fillRect(p.x - p.s * 0.5, p.y - p.s * 0.5, p.s, p.s);
+    for (const pt of byLayer[lyr]) {
+      ctx.fillStyle = `rgba(${pt.c[0]},${pt.c[1]},${pt.c[2]},${pt.a})`;
+      ctx.fillRect(pt.x - pt.s * 0.5, pt.y - pt.s * 0.5, pt.s, pt.s);
     }
   }
+}
+
+// ─────────────────────────────────────────────
+//  RENDER: SKELETON (inside portal only)
+// ─────────────────────────────────────────────
+const SKEL = [
+  [11,13],[13,15],[12,14],[14,16],
+  [11,12],[11,23],[12,24],[23,24],
+  [23,25],[25,27],[24,26],[26,28],
+];
+
+function drawSkeleton() {
+  const lm = state.poseLandmarks;
+  if (!lm) return;
+  ctx.save();
+  ctx.lineWidth = 1.3;
+  ctx.globalAlpha = 0.5;
+  for (const [a, b] of SKEL) {
+    if (!lm[a] || !lm[b]) continue;
+    if ((lm[a].visibility||0) < 0.4 || (lm[b].visibility||0) < 0.4) continue;
+    const ax = (1-lm[a].x)*W, ay = lm[a].y*H;
+    const bx = (1-lm[b].x)*W, by = lm[b].y*H;
+    const g = ctx.createLinearGradient(ax, ay, bx, by);
+    g.addColorStop(0, `hsla(${hue},100%,85%,0.9)`);
+    g.addColorStop(1, `hsla(${hue+60},100%,75%,0.7)`);
+    ctx.strokeStyle = g;
+    ctx.shadowColor = `hsl(${hue},100%,70%)`; ctx.shadowBlur = 5;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  }
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1; ctx.restore();
 }
 
 // ─────────────────────────────────────────────
 //  RENDER: JOINT EFFECTS
 // ─────────────────────────────────────────────
 function drawJointEffects(t) {
-  const joints = [11, 12, 13, 14, 23, 24, 25, 26]; // shoulders, elbows, hips, knees
+  const joints = [11,12,13,14,23,24,25,26];
   const lm = state.poseLandmarks;
   if (!lm) return;
-
   for (const ji of joints) {
-    if (!lm[ji] || lm[ji].visibility < 0.5) continue;
-    const jx = (1 - lm[ji].x) * W;
-    const jy = lm[ji].y * H;
-    const r = 8 + Math.sin(t * 0.005 + ji) * 2;
-
-    ctx.beginPath();
-    ctx.arc(jx, jy, r, 0, Math.PI * 2);
-    ctx.strokeStyle = `hsla(${hue + ji * 5},100%,70%,0.5)`;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // Orbiting mini-particles
+    if (!lm[ji] || (lm[ji].visibility||0) < 0.5) continue;
+    const jx = (1-lm[ji].x)*W, jy = lm[ji].y*H;
+    const r = 8 + Math.sin(t*0.005+ji)*2;
+    ctx.beginPath(); ctx.arc(jx, jy, r, 0, Math.PI*2);
+    ctx.strokeStyle = `hsla(${hue+ji*5},100%,70%,0.5)`; ctx.lineWidth = 1; ctx.stroke();
     for (let o = 0; o < 3; o++) {
-      const ang = t * 0.004 + (o * Math.PI * 2 / 3) + ji;
-      const ox = jx + Math.cos(ang) * (r + 6);
-      const oy = jy + Math.sin(ang) * (r + 6);
+      const ang = t*0.004 + (o*Math.PI*2/3) + ji;
       ctx.fillStyle = `hsla(${hue+120},100%,80%,0.8)`;
-      ctx.fillRect(ox - 1, oy - 1, 2, 2);
+      ctx.fillRect(jx+Math.cos(ang)*(r+6)-1, jy+Math.sin(ang)*(r+6)-1, 2, 2);
     }
-
-    // Telemetry label
-    const conf = Math.floor(85 + Math.sin(t * 0.002 + ji) * 10);
-    ctx.fillStyle = `hsla(${hue},100%,80%,0.6)`;
-    ctx.font = '8px Courier New';
-    ctx.fillText(`${conf}%`, jx + 10, jy - 5);
+    ctx.fillStyle = `hsla(${hue},100%,80%,0.6)`; ctx.font = '8px Courier New';
+    ctx.fillText(`${Math.floor(85+Math.sin(t*0.002+ji)*10)}%`, jx+10, jy-5);
   }
 }
 
 // ─────────────────────────────────────────────
-//  RENDER: PORTAL
+//  RENDER: PORTAL (with rotation)
 // ─────────────────────────────────────────────
 function drawPortal(t) {
   if (!state.smoothCorners) return;
   const c = state.smoothCorners;
+  const pcx = (c[0].x+c[1].x+c[2].x+c[3].x)*0.25;
+  const pcy = (c[0].y+c[1].y+c[2].y+c[3].y)*0.25;
 
-  // Clip path
   ctx.save();
+  // Rotate portal contents around portal center based on hand angle
+  ctx.translate(pcx, pcy);
+  ctx.rotate(state.portalAngle * 0.12);
+  ctx.translate(-pcx, -pcy);
+
   ctx.beginPath();
   ctx.moveTo(c[0].x, c[0].y);
   for (let i = 1; i < c.length; i++) ctx.lineTo(c[i].x, c[i].y);
   ctx.closePath();
   ctx.clip();
 
-  // Void + fog
-  ctx.fillStyle = 'rgba(0,0,8,0.85)';
-  ctx.fillRect(0, 0, W, H);
+  // Void
+  ctx.fillStyle = 'rgba(0,0,8,0.88)'; ctx.fillRect(0,0,W,H);
+  // Fog
+  const fog = ctx.createRadialGradient(pcx,pcy,0,pcx,pcy,300);
+  fog.addColorStop(0, `hsla(${hue+200},80%,20%,0.3)`);
+  fog.addColorStop(1, 'transparent');
+  ctx.fillStyle = fog; ctx.fillRect(0,0,W,H);
 
-  const gradX = (c[0].x + c[1].x + c[2].x + c[3].x) / 4;
-  const gradY = (c[0].y + c[1].y + c[2].y + c[3].y) / 4;
-  const fogGrad = ctx.createRadialGradient(gradX, gradY, 0, gradX, gradY, 300);
-  fogGrad.addColorStop(0, `hsla(${hue+200},80%,20%,0.3)`);
-  fogGrad.addColorStop(1, 'transparent');
-  ctx.fillStyle = fogGrad;
-  ctx.fillRect(0, 0, W, H);
-
-  // Grid
-  drawGrid(gradX, gradY);
-  // Ripples
+  drawGrid(pcx, pcy);
   updateRipples();
-  // Data streams
-  drawDataStreams(t);
-  // Scanline
+  drawDataStreams();
   drawScanline();
-  // Particles
   drawParticles(t);
-  // Joints
+  drawSkeleton();
   drawJointEffects(t);
 
   ctx.restore();
 
-  // Portal border
-  const phue = (hue % 360);
+  // Border (unrotated for stability)
+  const phue = hue % 360;
   ctx.save();
   ctx.beginPath();
   ctx.moveTo(c[0].x, c[0].y);
   for (let i = 1; i < c.length; i++) ctx.lineTo(c[i].x, c[i].y);
   ctx.closePath();
-
   ctx.strokeStyle = `hsla(${phue},100%,70%,0.9)`;
-  ctx.lineWidth = 2.5;
-  ctx.shadowColor = `hsl(${phue},100%,60%)`;
-  ctx.shadowBlur = 18;
-  ctx.stroke();
-  ctx.shadowBlur = 0;
+  ctx.lineWidth = 2.5; ctx.shadowColor = `hsl(${phue},100%,60%)`; ctx.shadowBlur = 18;
+  ctx.stroke(); ctx.shadowBlur = 0;
+  ctx.strokeStyle = `hsla(${phue+60},100%,80%,0.32)`; ctx.lineWidth = 5; ctx.stroke();
 
-  // Second border ring
-  ctx.strokeStyle = `hsla(${phue+60},100%,80%,0.4)`;
-  ctx.lineWidth = 5;
-  ctx.stroke();
-
-  // Corner markers
   for (let i = 0; i < c.length; i++) {
-    const ang = t * 0.005 + i;
-    const sz = 8 + Math.sin(ang) * 2;
-    ctx.fillStyle = `hsla(${phue + i*30},100%,80%,0.95)`;
-    ctx.shadowColor = `hsl(${phue + i*30},100%,70%)`;
-    ctx.shadowBlur = 12;
-    ctx.fillRect(c[i].x - sz/2, c[i].y - sz/2, sz, sz);
+    const sz = 8 + Math.sin(t*0.005+i)*2;
+    ctx.fillStyle = `hsla(${phue+i*30},100%,80%,0.95)`;
+    ctx.shadowColor = `hsl(${phue+i*30},100%,70%)`; ctx.shadowBlur = 12;
+    ctx.fillRect(c[i].x-sz*0.5, c[i].y-sz*0.5, sz, sz);
   }
-  ctx.shadowBlur = 0;
-  ctx.restore();
+  ctx.shadowBlur = 0; ctx.restore();
 }
 
 // ─────────────────────────────────────────────
@@ -616,38 +654,32 @@ function drawPortal(t) {
 function drawHUD(t) {
   const lm = state.poseLandmarks;
   let hudX = W - 230, hudY = 20;
-  if (lm && lm[11] && lm[11].visibility > 0.4) {
-    hudX = Math.min(W - 220, Math.max(20, (1 - lm[11].x) * W - 10));
-    hudY = Math.max(20, lm[11].y * H - 90);
+  if (lm && lm[11] && (lm[11].visibility||0) > 0.4) {
+    hudX = clamp((1-lm[11].x)*W - 10, 20, W-220);
+    hudY = Math.max(20, lm[11].y*H - 90);
   }
-
   ctx.save();
   ctx.fillStyle = 'rgba(0,20,30,0.75)';
-  ctx.strokeStyle = `hsla(${hue},100%,60%,0.6)`;
-  ctx.lineWidth = 1;
-  ctx.fillRect(hudX, hudY, 200, 120);
-  ctx.strokeRect(hudX, hudY, 200, 120);
+  ctx.strokeStyle = `hsla(${hue},100%,60%,0.6)`; ctx.lineWidth = 1;
+  ctx.fillRect(hudX, hudY, 200, 140); ctx.strokeRect(hudX, hudY, 200, 140);
 
   const lines = [
     `STATUS: ${state.scanPhase}`,
     `FPS: ${state.fps.toFixed(0)}`,
-    `PARTICLES: ${MAX_PARTICLES}`,
+    `PARTICLES: ${activeParticleCount}`,
     `PORTAL: ${state.portalActive ? 'ENGAGED' : 'STANDBY'}`,
-    `PHASE: SCAN-${(Math.floor(t * 0.01) % 9 + 1).toString().padStart(2,'0')}`,
+    `MODE: ${thermalMode ? 'THERMAL' : 'X-RAY'}`,
+    `PHASE: SCAN-${(Math.floor(t*0.01)%9+1).toString().padStart(2,'0')}`,
   ];
-
   ctx.font = '10px Courier New';
   for (let i = 0; i < lines.length; i++) {
-    const flash = i === 0 && state.scanPhase === 'ACTIVE' ? Math.sin(t * 0.01) > 0 : true;
+    const flash = (i===0 && state.scanPhase==='ACTIVE') ? Math.sin(t*0.01)>0 : true;
     ctx.fillStyle = flash ? `hsla(${hue},100%,70%,0.9)` : `hsla(${hue},60%,40%,0.5)`;
-    ctx.fillText(lines[i], hudX + 10, hudY + 16 + i * 20);
+    ctx.fillText(lines[i], hudX+10, hudY+16+i*20);
   }
-
-  // Corner decoration
-  const corners = [[hudX, hudY],[hudX+200,hudY],[hudX,hudY+120],[hudX+200,hudY+120]];
-  for (const [cx,cy] of corners) {
-    ctx.fillStyle = `hsl(${hue},100%,70%)`;
-    ctx.fillRect(cx - 3, cy - 3, 6, 6);
+  const co = [[hudX,hudY],[hudX+200,hudY],[hudX,hudY+140],[hudX+200,hudY+140]];
+  for (const [cx,cy] of co) {
+    ctx.fillStyle = `hsl(${hue},100%,70%)`; ctx.fillRect(cx-3,cy-3,6,6);
   }
   ctx.restore();
 }
@@ -656,71 +688,32 @@ function drawHUD(t) {
 //  RENDER: RADAR
 // ─────────────────────────────────────────────
 function drawRadar(t) {
-  const rx = 70, ry = H - 80, radius = 55;
+  const rx=70, ry=H-80, radius=55;
   radarAngle += 0.04;
-
   ctx.save();
-
-  // Bg
-  ctx.beginPath();
-  ctx.arc(rx, ry, radius, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(0,15,20,0.8)';
-  ctx.fill();
-  ctx.strokeStyle = `hsla(${hue},100%,50%,0.5)`;
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  // Rings
-  for (let r = radius / 3; r <= radius; r += radius / 3) {
-    ctx.beginPath();
-    ctx.arc(rx, ry, r, 0, Math.PI * 2);
-    ctx.strokeStyle = `hsla(${hue},60%,40%,0.3)`;
-    ctx.stroke();
+  ctx.beginPath(); ctx.arc(rx,ry,radius,0,Math.PI*2);
+  ctx.fillStyle='rgba(0,15,20,0.8)'; ctx.fill();
+  ctx.strokeStyle=`hsla(${hue},100%,50%,0.5)`; ctx.lineWidth=1; ctx.stroke();
+  for (let r=radius/3; r<=radius; r+=radius/3) {
+    ctx.beginPath(); ctx.arc(rx,ry,r,0,Math.PI*2);
+    ctx.strokeStyle=`hsla(${hue},60%,40%,0.3)`; ctx.stroke();
   }
-
-  // Cross
-  ctx.strokeStyle = `hsla(${hue},60%,40%,0.3)`;
-  ctx.beginPath(); ctx.moveTo(rx - radius, ry); ctx.lineTo(rx + radius, ry); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(rx, ry - radius); ctx.lineTo(rx, ry + radius); ctx.stroke();
-
-  // Sweep
-  const sweepGrad = ctx.createConicalGradient ? null : null;
-  ctx.save();
-  ctx.translate(rx, ry);
-  ctx.rotate(radarAngle);
-  const grad = ctx.createLinearGradient(0, 0, radius, 0);
-  grad.addColorStop(0, `hsla(${hue},100%,60%,0.8)`);
-  grad.addColorStop(1, `hsla(${hue},100%,60%,0)`);
-  ctx.strokeStyle = `hsla(${hue},100%,60%,0.8)`;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.lineTo(radius, 0);
-  ctx.stroke();
-
-  // Sweep fill arc
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.arc(0, 0, radius, 0, 0.8);
-  ctx.closePath();
-  ctx.fillStyle = `hsla(${hue},100%,50%,0.07)`;
-  ctx.fill();
+  ctx.strokeStyle=`hsla(${hue},60%,40%,0.3)`;
+  ctx.beginPath(); ctx.moveTo(rx-radius,ry); ctx.lineTo(rx+radius,ry); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(rx,ry-radius); ctx.lineTo(rx,ry+radius); ctx.stroke();
+  ctx.save(); ctx.translate(rx,ry); ctx.rotate(radarAngle);
+  ctx.strokeStyle=`hsla(${hue},100%,60%,0.8)`; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(radius,0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,radius,0,0.8); ctx.closePath();
+  ctx.fillStyle=`hsla(${hue},100%,50%,0.07)`; ctx.fill();
   ctx.restore();
-
-  // Blip for portal
   if (state.portalActive) {
-    const bx = rx + Math.sin(t * 0.003) * radius * 0.5;
-    const by = ry - Math.cos(t * 0.003) * radius * 0.5;
     ctx.beginPath();
-    ctx.arc(bx, by, 3, 0, Math.PI * 2);
-    ctx.fillStyle = `hsl(${hue+120},100%,70%)`;
-    ctx.fill();
+    ctx.arc(rx+Math.sin(t*0.003)*radius*0.5, ry-Math.cos(t*0.003)*radius*0.5, 3, 0, Math.PI*2);
+    ctx.fillStyle=`hsl(${hue+120},100%,70%)`; ctx.fill();
   }
-
-  ctx.font = '8px Courier New';
-  ctx.fillStyle = `hsla(${hue},100%,70%,0.6)`;
-  ctx.fillText('RADAR', rx - 15, ry + radius + 13);
-
+  ctx.font='8px Courier New'; ctx.fillStyle=`hsla(${hue},100%,70%,0.6)`;
+  ctx.fillText('RADAR', rx-15, ry+radius+13);
   ctx.restore();
 }
 
@@ -728,27 +721,17 @@ function drawRadar(t) {
 //  RENDER: PIPELINE
 // ─────────────────────────────────────────────
 function drawPipeline() {
-  const steps = ['INPUT','DETECT','POSE','PORTAL','OUTPUT'];
-  const startX = W / 2 - (steps.length * 75) / 2;
-  const py = 22;
-
+  const steps=['INPUT','DETECT','POSE','PORTAL','OUTPUT'];
+  const sx0 = W/2-(steps.length*75)/2; const py=22;
   ctx.save();
-  for (let i = 0; i < steps.length; i++) {
-    const sx = startX + i * 75;
-    const active = state.portalActive && i <= 4 ||
-                   state.scanPhase === 'SCANNING' && i <= 2 ||
-                   i === 0;
-    ctx.fillStyle = active ? `hsla(${hue + i*20},100%,65%,0.9)` : 'rgba(80,80,80,0.4)';
-    ctx.font = '9px Courier New';
-    ctx.fillText(steps[i], sx, py);
-
-    if (i < steps.length - 1) {
-      ctx.strokeStyle = active ? `hsla(${hue},100%,50%,0.5)` : 'rgba(80,80,80,0.3)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(sx + 45, py - 4);
-      ctx.lineTo(sx + 68, py - 4);
-      ctx.stroke();
+  for (let i=0; i<steps.length; i++) {
+    const sx=sx0+i*75;
+    const active=(state.portalActive&&i<=4)||(state.scanPhase==='SCANNING'&&i<=2)||i===0;
+    ctx.fillStyle=active?`hsla(${hue+i*20},100%,65%,0.9)`:'rgba(80,80,80,0.4)';
+    ctx.font='9px Courier New'; ctx.fillText(steps[i],sx,py);
+    if (i<steps.length-1) {
+      ctx.strokeStyle=active?`hsla(${hue},100%,50%,0.5)`:'rgba(80,80,80,0.3)';
+      ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(sx+45,py-4); ctx.lineTo(sx+68,py-4); ctx.stroke();
     }
   }
   ctx.restore();
@@ -757,161 +740,156 @@ function drawPipeline() {
 // ─────────────────────────────────────────────
 //  RENDER: FRAME COUNTER + GLITCH TEXT
 // ─────────────────────────────────────────────
-const glitchTexts = ['ERR: SEG FAULT', '0xFFE3 CORRUPT', 'SCAN INTERRUPT', 'MEM OVERFLOW', 'SIGNAL LOST', '0x4D3D3D FATAL'];
-let activeGlitch = '';
+const glitchTexts=['ERR: SEG FAULT','0xFFE3 CORRUPT','SCAN INTERRUPT','MEM OVERFLOW','SIGNAL LOST','0x4D3D3D FATAL'];
+let activeGlitch='';
 
 function drawFrameCounter(t) {
   ctx.save();
-  ctx.font = '9px Courier New';
-  ctx.fillStyle = `hsla(${hue},60%,50%,0.5)`;
-  ctx.fillText(`FRAME: ${state.frameCount.toString().padStart(6,'0')}`, W - 150, H - 10);
-  ctx.fillText(`T:${Math.floor(t).toString().padStart(8,'0')}ms`, W - 150, H - 22);
-
+  ctx.font='9px Courier New'; ctx.fillStyle=`hsla(${hue},60%,50%,0.5)`;
+  ctx.fillText(`FRAME: ${state.frameCount.toString().padStart(6,'0')}`, W-150, H-10);
+  ctx.fillText(`T:${Math.floor(t).toString().padStart(8,'0')}ms`, W-150, H-22);
   if (state.glitchActive && activeGlitch) {
-    ctx.font = 'bold 13px Courier New';
-    ctx.fillStyle = `rgba(255,40,40,${0.7 + Math.random()*0.3})`;
-    ctx.fillText(activeGlitch, Math.random() * 200 + W/2 - 100, Math.random() * 50 + H/2);
+    ctx.font='bold 13px Courier New';
+    ctx.fillStyle=`rgba(255,40,40,${0.7+Math.random()*0.3})`;
+    ctx.fillText(activeGlitch, Math.random()*200+W/2-100, Math.random()*50+H/2);
   }
   ctx.restore();
 }
 
 // ─────────────────────────────────────────────
-//  RENDER: GLITCH EFFECTS
+//  GLITCH SYSTEM (optimized)
 // ─────────────────────────────────────────────
 function triggerGlitch() {
-  state.glitchActive = true;
-  state.glitchTimer = 8 + Math.floor(Math.random() * 10);
-  activeGlitch = glitchTexts[Math.floor(Math.random() * glitchTexts.length)];
-  glitchSlices.length = 0;
-  for (let i = 0; i < 4 + Math.floor(Math.random()*4); i++) {
+  state.glitchActive=true; state.glitchTimer=10+Math.floor(Math.random()*8); state.glitchFrame=0;
+  activeGlitch=glitchTexts[Math.floor(Math.random()*glitchTexts.length)];
+  glitchSlices.length=0;
+  // Max 3 slices, small height
+  const count=2+Math.floor(Math.random()*2);
+  for (let i=0;i<count;i++) {
     glitchSlices.push({
-      y: Math.random() * H,
-      h: 4 + Math.random() * 20,
-      offset: (Math.random() - 0.5) * 40,
+      y: Math.floor(Math.random()*H),
+      h: 2+Math.floor(Math.random()*5),
+      offset: Math.floor((Math.random()-0.5)*28),
     });
   }
 }
 
 function applyGlitch() {
   if (!state.glitchActive) return;
-  state.glitchTimer--;
-  if (state.glitchTimer <= 0) {
-    state.glitchActive = false;
-    glitchSlices.length = 0;
-    return;
+  state.glitchTimer--; state.glitchFrame++;
+  if (state.glitchTimer<=0) { state.glitchActive=false; glitchSlices.length=0; return; }
+  // Only do pixel shift every 2-3 frames to save cost
+  if (state.glitchFrame%3===0) {
+    for (const sl of glitchSlices) {
+      try {
+        const img=ctx.getImageData(0, sl.y, W, sl.h);
+        ctx.putImageData(img, sl.offset, sl.y);
+      } catch(e) {}
+    }
   }
-  // Horizontal slices
-  for (const sl of glitchSlices) {
-    const img = ctx.getImageData(0, sl.y, W, sl.h);
-    ctx.putImageData(img, sl.offset, sl.y);
+  if (state.glitchTimer>8) {
+    ctx.fillStyle=`rgba(255,255,255,${0.015+Math.random()*0.025})`;
+    ctx.fillRect(0,0,W,H);
   }
-  // White flash on first frame
-  if (state.glitchTimer > 6) {
-    ctx.fillStyle = `rgba(255,255,255,${0.03 + Math.random()*0.04})`;
-    ctx.fillRect(0, 0, W, H);
-  }
-  // Noise overlay
-  ctx.fillStyle = `rgba(${Math.random()*50},${Math.random()*20},${Math.random()*20},0.03)`;
-  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle=`rgba(${Math.random()*35},${Math.random()*12},${Math.random()*12},0.02)`;
+  ctx.fillRect(0,0,W,H);
 }
 
 // ─────────────────────────────────────────────
-//  RENDER: ENERGY BURST PARTICLES
+//  ENERGY BURST
 // ─────────────────────────────────────────────
-const burstParticles = [];
+const burstParticles=[];
 function triggerBurst() {
-  burstParticles.length = 0;
-  for (let i = 0; i < 60; i++) {
-    const ang = Math.random() * Math.PI * 2;
-    const spd = 3 + Math.random() * 8;
+  burstParticles.length=0;
+  for (let i=0;i<60;i++) {
+    const ang=Math.random()*Math.PI*2, spd=3+Math.random()*8;
     burstParticles.push({
-      x: smooth.center.x, y: smooth.center.y,
-      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd,
-      life: 1, color: ZONE_COLORS[Math.floor(Math.random()*7)],
+      x:smooth.center.x, y:smooth.center.y,
+      vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd,
+      life:1, color:ZONE_COLORS[Math.floor(Math.random()*7)],
     });
   }
 }
-
 function drawBurst() {
-  for (let i = burstParticles.length - 1; i >= 0; i--) {
-    const p = burstParticles[i];
-    p.x += p.vx; p.y += p.vy;
-    p.vx *= 0.94; p.vy *= 0.94;
-    p.life -= 0.035;
-    if (p.life <= 0) { burstParticles.splice(i,1); continue; }
-    ctx.fillStyle = `rgba(${p.color[0]},${p.color[1]},${p.color[2]},${p.life})`;
+  for (let i=burstParticles.length-1;i>=0;i--) {
+    const p=burstParticles[i];
+    p.x+=p.vx; p.y+=p.vy; p.vx*=0.94; p.vy*=0.94; p.life-=0.035;
+    if (p.life<=0) { burstParticles.splice(i,1); continue; }
+    ctx.fillStyle=`rgba(${p.color[0]},${p.color[1]},${p.color[2]},${p.life})`;
     ctx.fillRect(p.x, p.y, 3, 3);
   }
 }
 
 // ─────────────────────────────────────────────
-//  RENDER: EXTERNAL HUD (outside portal)
+//  EXTERNAL HUD
 // ─────────────────────────────────────────────
 function drawExternalHUD(t) {
-  drawHUD(t);
-  drawRadar(t);
-  drawPipeline();
-  drawFrameCounter(t);
-  drawBurst();
+  drawHUD(t); drawRadar(t); drawPipeline(); drawFrameCounter(t); drawBurst();
+}
+
+// ─────────────────────────────────────────────
+//  ADAPTIVE PERFORMANCE
+// ─────────────────────────────────────────────
+function adaptPerformance() {
+  if (state.fps < 30 && activeParticleCount > MIN_PARTICLES) {
+    activeParticleCount = Math.max(MIN_PARTICLES, activeParticleCount - 300);
+  } else if (state.fps > 50 && activeParticleCount < MAX_PARTICLES) {
+    activeParticleCount = Math.min(MAX_PARTICLES, activeParticleCount + 150);
+  }
 }
 
 // ─────────────────────────────────────────────
 //  MAIN LOOP
 // ─────────────────────────────────────────────
-let lastGlitch = 0;
+let lastGlitch=0, perfTick=0;
 
 function loop(t) {
   requestAnimationFrame(loop);
 
-  // FPS
-  const now = performance.now();
-  const dt = now - state.lastTime;
-  state.lastTime = now;
-  state.fpsArr.push(1000 / dt);
-  if (state.fpsArr.length > 30) state.fpsArr.shift();
-  state.fps = state.fpsArr.reduce((a,b)=>a+b,0) / state.fpsArr.length;
+  const now=performance.now();
+  const dt=now-state.lastTime; state.lastTime=now;
+  state.fpsArr.push(1000/Math.max(dt,1));
+  if (state.fpsArr.length>30) state.fpsArr.shift();
+  state.fps=state.fpsArr.reduce((a,b)=>a+b,0)/state.fpsArr.length;
   state.frameCount++;
-  hue = (hue + 0.4) % 360;
+  hue=(hue+0.4)%360;
 
-  // Energy burst timer
+  if (++perfTick%60===0) adaptPerformance();
+
   if (state.energyBurst) {
-    if (state.burstTimer === 30) triggerBurst();
+    if (state.burstTimer===30) triggerBurst();
     state.burstTimer--;
-    if (state.burstTimer <= 0) state.energyBurst = false;
+    if (state.burstTimer<=0) state.energyBurst=false;
   }
 
-  // Random glitch
-  if (t - lastGlitch > 4000 + Math.random() * 8000 && !state.glitchActive) {
-    lastGlitch = t;
-    triggerGlitch();
+  // Random glitch — longer minimum gap (6s)
+  if (t-lastGlitch > 6000+Math.random()*10000 && !state.glitchActive) {
+    lastGlitch=t; triggerGlitch();
   }
 
   // Auto ripple from chest
-  if (state.poseLandmarks && state.portalActive && Math.random() < 0.02) {
-    const lm = state.poseLandmarks;
+  if (state.poseLandmarks && state.portalActive && Math.random()<0.02) {
+    const lm=state.poseLandmarks;
     if (lm[11] && lm[12]) {
       ripples.push({
-        x: ((1-lm[11].x) + (1-lm[12].x)) / 2 * W,
-        y: (lm[11].y + lm[12].y) / 2 * H,
-        r: 0, maxR: 180, alpha: 1,
+        x:((1-lm[11].x)+(1-lm[12].x))*0.5*W,
+        y:(lm[11].y+lm[12].y)*0.5*H,
+        r:0, maxR:180, alpha:1,
       });
     }
   }
 
   // ─── DRAW ───
-  ctx.clearRect(0, 0, W, H);
+  ctx.clearRect(0,0,W,H);
   drawBackground();
 
   if (state.portalActive && state.smoothCorners) {
     drawPortal(t);
   } else {
-    // Outside portal: still draw ambient particles on body
-    if (state.poseLandmarks || bodyPixels) {
-      ctx.save();
-      ctx.globalAlpha = 0.4;
+    if (bodyPointCount > 0) {
+      ctx.save(); ctx.globalAlpha=0.32;
       drawParticles(t);
-      ctx.globalAlpha = 1;
-      ctx.restore();
+      ctx.globalAlpha=1; ctx.restore();
     }
     updateRipples();
     drawScanline();
@@ -920,14 +898,14 @@ function loop(t) {
   drawExternalHUD(t);
   applyGlitch();
 
-  // Subtle chromatic aberration flash
+  // Chromatic aberration
   if (state.portalActive) {
-    ctx.globalCompositeOperation = 'screen';
-    ctx.globalAlpha = 0.015;
-    ctx.drawImage(canvas, 1, 0);
-    ctx.drawImage(canvas, -1, 0);
-    ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalCompositeOperation='screen';
+    ctx.globalAlpha=0.012;
+    ctx.drawImage(canvas,1,0);
+    ctx.drawImage(canvas,-1,0);
+    ctx.globalAlpha=1;
+    ctx.globalCompositeOperation='source-over';
   }
 }
 
